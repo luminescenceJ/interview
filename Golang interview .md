@@ -336,6 +336,237 @@ func Remove(h Interface, i int) interface{}  // 从指定位置删除数据，�
 func Fix(h Interface, i int)  // 从i位置数据发生改变后，对堆再平衡，优先级队列使用到了该方法
 ```
 
+### sync
+
+#### cond
+
+在并发编程中，`sync.Cond`（条件变量）是一种用于 **协调多个 Goroutine 间等待和通知的机制**。在 `ants` 协程池库中，条件变量被用来高效管理 Worker 的 **休眠与唤醒**，避免忙等待（Busy Waiting）造成的 CPU 资源浪费。
+
+##### **核心作用**
+
+**1. 解决的问题**
+
+- **场景**：当多个 Goroutine 需要等待某个条件（如任务到达、资源可用）时，若使用忙等待（循环检查条件），会导致 CPU 空转。
+- 条件变量的优势：
+  - 在条件不满足时，Goroutine **主动休眠**，释放 CPU。
+  - 条件满足时，**精确唤醒** 等待的 Goroutine，减少无效唤醒。
+
+**2. 核心方法**
+
+|     方法      |                             作用                             |
+| :-----------: | :----------------------------------------------------------: |
+|   `Wait()`    | 释放锁并阻塞，直到被 `Signal` 或 `Broadcast` 唤醒（唤醒后重新获取锁） |
+|  `Signal()`   |             唤醒一个等待的 Goroutine（随机选择）             |
+| `Broadcast()` |                   唤醒所有等待的 Goroutine                   |
+
+##### **底层原理**
+
+```go
+type Cond struct {
+	noCopy noCopy 
+	L Locker // L is held while observing or changing the condition
+	notify  notifyList  // 指针记录关注的地址
+	checker copyChecker // 记录条件变量是否被复制
+}
+```
+
+**1. 依赖关系**
+
+- **必须与锁（`sync.Mutex` 或 `sync.RWMutex`）结合使用**：
+  条件变量的操作需要在锁的保护下进行，确保对共享状态的原子访问。
+
+**2. 内部实现**
+
+- **等待队列**：维护一个 FIFO 队列，记录所有调用 `Wait()` 的 Goroutine。
+- **操作系统级阻塞**：`Wait()` 内部通过 `sync.runtime_notifyListWait` 进入阻塞状态，由调度器管理。
+
+#####  在 `ants` 中的应用
+
+在 `ants` 库中，条件变量主要用于 **Worker 的休眠与唤醒**，以下是关键代码片段和解析：
+
+###### **1. 创建一个Worker**
+
+当协程池提交任务时，`Submit()`被调用，触发`retrieveWorker()`唤醒或创建一个worker执行任务。
+
+```go
+// 尝试获取一个可用 worker 来运行任务。如果没有空闲 worker，则可能会：新建一个 worker|阻塞等待一个释放的 worker|报错退出（超出上限或设置为 non-blocking）
+func (p *poolCommon) retrieveWorker() (w worker, err error) {
+	p.lock.Lock() // 线程安全
+
+retry:
+	// 尝试从 worker 队列中获取可用 worker
+	if w = p.workers.detach(); w != nil {
+		p.lock.Unlock()
+		return
+	}
+
+	// 如果没有，判断是否可以新建 worker。如果还没达到 pool 容量上限，就从缓存拿一个新的 worker 并启动。
+	if capacity := p.Cap(); capacity == -1 || capacity > p.Running() {
+		p.lock.Unlock()
+		w = p.workerCache.Get().(worker)
+		w.run()
+		return
+	}
+
+	// 如果是 non-blocking 模式，或排队线程数已达上限，则直接返回错误
+	if p.options.Nonblocking || (p.options.MaxBlockingTasks != 0 && p.Waiting() >= p.options.MaxBlockingTasks) {
+		p.lock.Unlock()
+		return nil, ErrPoolOverload
+	}
+
+	// 使用条件变量阻塞当前 goroutine，等待有 worker 被释放，注意，后续会回到起始的retry处重新分配worker
+	p.addWaiting(1)
+	p.cond.Wait() // block and wait for an available worker
+	p.addWaiting(-1)
+
+	if p.IsClosed() {
+		p.lock.Unlock()
+		return nil, ErrPoolClosed
+	}
+
+	goto retry
+}
+```
+
+条件变量阻塞直到有其他 worker 被放回池子，会通过 `p.cond.Signal()` 进行唤醒。
+
+> 注意：`p.cond` 是在获取了 `p.lock` 之后调用的 `Wait()`，这是条件变量的经典用法：条件变量必须和互斥锁配合使用，防止竞态条件。
+>
+> `Wait()` 过程中需要 **自动释放锁，挂起等待，恢复后重新加锁**，这样才能保证**在检查条件、挂起等待、被唤醒这整个流程中是安全的**，避免**竞态条件**。
+>
+> 条件变量配合互斥锁使用，是为了确保“检查条件 + 挂起等待”这一步是原子操作，避免竞态和虚假唤醒，确保被唤醒后的逻辑是正确的。
+
+> 例子：没有锁，会有竞态
+>
+> ```go
+> if pool.length == 0 {
+>     cond.Wait() // ⛔ 可能刚好别人 push 进来了，但你还在等
+> }
+> ```
+>
+> - 上面的 `if` 判断和 `Wait()` 之间不是原子操作！
+> - 如果判断完之后，还没进入 `Wait()`，恰好有另一个 goroutine 添加了元素并 `Signal()`，你就可能错过信号，**永远挂起等待**！
+>
+> 使用 `mutex` 锁就能让这一段逻辑变成**原子性操作**：
+>
+> ```go
+> mutex.Lock()
+> for pool.length == 0 {
+>     cond.Wait() // 会释放锁，挂起；被唤醒后重新加锁，继续检查
+> }
+> mutex.Unlock()
+> ```
+>
+> 这就是通过加锁避免竞态条件。
+
+###### **2. 回收一个worker**
+
+将一个空闲的 worker **放回线程池（WorkerQueue）** 的函数，也就是一个“回收重用”的逻辑
+
+```go
+func (p *poolCommon) revertWorker(worker worker) bool {
+	if capacity := p.Cap(); (capacity > 0 && p.Running() > capacity) || p.IsClosed() {
+		p.cond.Broadcast() // 确保池关闭或超容时，所有等待的 Goroutine 能及时退出。
+		return false
+	}
+
+	worker.setLastUsedTime(p.nowTime()) // 记录回收时间戳，供空闲 Worker 超时清理机制使用（如 ants.WithExpiryDuration 选项）
+
+	p.lock.Lock() // 防止竟态条件
+    // 加锁后的双重检查：防止无锁快速路径检查后，其他 Goroutine 可能已关闭池
+	if p.IsClosed() {
+		p.lock.Unlock()
+		return false
+	}
+    
+	if err := p.workers.insert(worker); err != nil {
+		p.lock.Unlock()
+		return false
+	}
+
+	p.cond.Signal() // 仅唤醒一个等待的Goroutine
+	p.lock.Unlock()
+	return true
+}
+```
+
+###### **3. worker容量调整**
+
+` Tune`函数动态调整池容量的，使用条件变量 `cond.Signal()` 和 `cond.Broadcast()` 来唤醒正在等待 worker 的 goroutine
+
+```go
+func (p *poolCommon) Tune(size int) {
+	capacity := p.Cap()
+	if capacity == -1 || size <= 0 || size == capacity || p.options.PreAlloc { // 容量空|目标大小size不合法|目标和容量相等|预分配内存（循环队列：容量已固定）
+		return
+	}
+	atomic.StoreInt32(&p.capacity, int32(size)) // 更新容量为新的 size
+	if size > capacity { // 如果变更是“扩容”，说明可能有等待的调用方可以继续执行。
+		if size-capacity == 1 {
+            // 如果只是扩容 1 个位置，用 Signal() 唤醒 一个等待中的调用方；
+         	// 否则，用 Broadcast() 唤醒 所有等待的调用方。
+			p.cond.Signal()
+			return
+		}
+		p.cond.Broadcast()
+	}
+}
+```
+
+### runtime
+
+#### Gosched()
+
+`runtime.Gosched()` 是 Go 语言中用于 **协作式调度** 的关键函数，它主动让出当前 Goroutine 占用的 CPU 时间片，使调度器有机会运行其他就绪的 Goroutine。关键在于
+
+- **让出当前 CPU 时间片**：
+  调用 `runtime.Gosched()` 会立即暂停当前 Goroutine 的执行，将其放回 ​**​全局运行队列​**​（Global Run Queue），触发 Go 调度器的重新调度。
+- **非阻塞式让出**：
+  当前 Goroutine 不会进入阻塞状态，而是进入 ​**​可运行状态​**​（Runnable），等待下次被调度器选中。
+
+> 具体会让出多少CPU时间？
+>
+> **没有固定时间长度**，取决于**其他 Goroutine 的就绪状态**，若有其他就绪的 Goroutine，调度器会选择其中一个运行。若没有，当前 Goroutine 可能立即恢复执行（例如在单核场景下）。Go 调度器（基于 G-P-M 模型）会尽量保证 Goroutine 的公平调度，但优先级不固定。
+
+##### **与调度器的关系**
+
+- **Go 1.14 前**：
+  调度器依赖 Goroutine 主动让出（如 `Gosched()`、系统调用、channel 操作），否则可能独占 CPU。
+- **Go 1.14+**：
+  引入 ​**​基于信号的抢占式调度​**​，即使 Goroutine 不主动让出，调度器也会强制抢占（如 10ms 时间片耗尽）。
+  ​**​但 `Gosched()` 仍有效​**​：在需要更细粒度控制时（如避免延迟），主动让出更可靠。
+
+##### **性能影响**
+
+- **轻量级操作**：
+  调用 `Gosched()` 仅触发调度器上下文切换，开销极小（约 100~200 纳秒）。
+- **过度使用的风险**：
+  频繁调用可能导致不必要的调度开销（如每循环一次调用一次），需权衡使用频率。
+
+##### **对比其他方式**
+
+|      **方式**       |             **触发调度场景**             | **是否主动让出** |
+| :-----------------: | :--------------------------------------: | :--------------: |
+| `runtime.Gosched()` |            立即让出，触发调度            |       主动       |
+|   `time.Sleep(0)`   |        让出 CPU，但依赖计时器精度        |       被动       |
+|    Channel 操作     | 阻塞时自动让出（如读写未就绪的 channel） |       被动       |
+|      系统调用       |           进入内核态时自动让出           |       被动       |
+
+#### Goexit
+
+调用此函数会立即使当前的goroutine的运行终止（终止协程），而其它的goroutine并不会受此影响。runtime.Goexit在终止当前goroutine前会先执行此goroutine的还未执行的defer语句。请注意千万别在主函数调用runtime.Goexit，因为会引发panic。
+
+#### GOMAXPROCS
+
+用来设置可以并行计算的CPU核数最大值，并返回之前的值。
+
+默认此函数的值与ＣＰＵ逻辑个数相同，即有多少个goroutine并发执行，当然可以设置它，它的取值是1～256。最好在主函数在开始前设置它，因为设置它会停止当前程序的运行。
+
+GO默认是使用一个CPU核的，除非设置runtime.GOMAXPROCS
+那么在多核环境下，什么情况下设置runtime.GOMAXPROCS会比较好的提高速度呢？
+
+适合于CPU密集型、并行度比较高的情景。如果是IO密集型，CPU之间的切换也会带来性能的损失。
+
 ## 保留关键字
 
 golang 有 25 个保留的关键字，这些关键字不能用作程序标识符。
@@ -1955,58 +2186,106 @@ BenchmarkRWLock-12          320209          3834 ns/op
 
 自旋锁是指当一个线程（在 Go 中是 Goroutine）在获取锁的时候，如果**锁已经被其他线程获取**，那么**该线程将循环等待**（自旋），**不断判断锁是否已经被释放**，而不是进入睡眠状态。
 
-使用atomic实现
+**核心设计目标**
+
+- **低延迟获取锁**：在低竞争场景下快速通过 CAS 获取锁（无系统调用开销）。
+- **高竞争适应性**：通过指数退避减少 CPU 空转消耗。
+- **公平性平衡**：通过 `runtime.Gosched()` 让出 CPU 时间片，防止 Goroutine 饥饿。
 
 ```go
-import (
-    "sync/atomic"
-    "time"
-)
+type spinLock uint32
 
-type Spinlock struct {
-    locked int32
+const maxBackoff = 16 // 最大退避所对应的时间
+
+func (sl *spinLock) Lock() {
+	backoff := 1
+	for !atomic.CompareAndSwapUint32((*uint32)(sl), 0, 1) {
+		for i := 0; i < backoff; i++ {
+			runtime.Gosched() // 主动让出时间
+		}
+		if backoff < maxBackoff {
+			backoff <<= 1 // 指数退避
+		}
+	}
 }
 
-func (s *Spinlock) Lock() {
-    for !atomic.CompareAndSwapInt32(&s.locked, 0, 1) {
-        // 这里可以添加一些退避策略，比如随机等待一段时间，以避免过多的CPU占用
-        // time.Sleep(time.Nanosecond) // 注意：实际使用中可能不需要或想要这样的退避
-    }
-}
-
-func (s *Spinlock) Unlock() {
-    atomic.StoreInt32(&s.locked, 0)
-}
-
-func main() {
-    var lock Spinlock
-
-    // 示例：使用自旋锁
-    go func() {
-        lock.Lock()
-        // 执行一些操作...
-        lock.Unlock()
-    }()
-
-    // 在另一个goroutine中尝试获取锁
-    go func() {
-        lock.Lock()
-        // 执行一些操作...
-        lock.Unlock()
-    }()
-
-    // 等待足够的时间以确保goroutines完成
-    time.Sleep(time.Second)
+func (sl *spinLock) Unlock() {
+	atomic.StoreUint32((*uint32)(sl), 0)
 }
 ```
-
-在这个例子中，
 
 1. `Spinlock` 结构体有一个 `int32` 类型的字段 `locked`，用于表示锁的状态。
 2. `Lock` 方法使用 `atomic.CompareAndSwapInt32` 原子操作来尝试将 `locked` 从0（未锁定）更改为1（已锁定）。如果锁已经被另一个goroutine持有（即 `locked` 为1），则 `CompareAndSwapInt32` 会返回 `false`，并且循环会继续。
 3. `Unlock` 方法使用 `atomic.StoreInt32` 原子操作将 `locked` 设置回0，表示锁已被释放。
 
-需要注意的是，在实际应用中，自旋锁可能会导致CPU资源的过度占用，特别是在锁被长时间持有或存在大量竞争的情况下。因此，在使用自旋锁之前，应该仔细考虑其适用性和潜在的性能影响。在许多情况下，使用互斥锁（`sync.Mutex`）或其他更高级的同步机制可能是更好的选择。
+此自旋锁设计通过 **CAS 原子操作、指数退避和协作式调度** 的三角优化，在 **低/中竞争场景** 下实现了比标准库锁更低的延迟，同时避免传统自旋锁的 CPU 资源浪费问题。其核心思想是：**用短暂的空转换取无系统调用的速度优势，用退避算法平衡竞争强度**。
+
+> 下面的例子是使用*testing.PB 中的 RunParallel() 模拟高并发场景。多个 Goroutine 同时争抢锁，评估锁在高竞争下的性能。`pb.Next()` 确保每个 Goroutine 执行足够的次数。
+>
+> 三种方式，Mutex互斥锁方案，SpinMutex线性/指数退避方案。
+>
+> 使用`go test -bench .` 来运行所有测试案例得出对应的时间 
+
+```go
+type originSpinLock uint32
+
+func (sl *originSpinLock) Lock() {
+	for !atomic.CompareAndSwapUint32((*uint32)(sl), 0, 1) {
+		runtime.Gosched()
+	}
+}
+
+func (sl *originSpinLock) Unlock() {
+	atomic.StoreUint32((*uint32)(sl), 0)
+}
+
+func NewOriginSpinLock() sync.Locker {
+	return new(originSpinLock)
+}
+
+func BenchmarkMutex(b *testing.B) {
+	m := sync.Mutex{}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			m.Lock()
+			//nolint:staticcheck
+			m.Unlock()
+		}
+	})
+}
+
+func BenchmarkSpinLock(b *testing.B) {
+	spin := NewOriginSpinLock()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			spin.Lock()
+			//nolint:staticcheck
+			spin.Unlock()
+		}
+	})
+}
+
+func BenchmarkBackOffSpinLock(b *testing.B) {
+	spin := NewSpinLock()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			spin.Lock()
+			//nolint:staticcheck
+			spin.Unlock()
+		}
+	})
+}
+
+/*
+Benchmark result for three types of locks:
+	goos: darwin
+	goarch: arm64
+	pkg: github.com/panjf2000/ants/v2/pkg/sync
+	BenchmarkMutex-10              	10452573	       111.1 ns/op	       0 B/op	       0 allocs/op
+	BenchmarkSpinLock-10           	58953211	        18.01 ns/op	       0 B/op	       0 allocs/op
+	BenchmarkBackOffSpinLock-10    	100000000	        10.81 ns/op	       0 B/op	       0 allocs/op
+*/
+```
 
 **goroutine 的自旋占用资源如何解决**
 
@@ -3197,6 +3476,202 @@ GORM 是基于反射实现的 ORM 框架，通过结构体与数据库表的自�
 
 **数据库方言支持（Dialector）**
  GORM 通过 Dialector 抽象不同数据库语法差异，如 MySQL、PostgreSQL、SQLite 等，内部统一构建 SQL，再由对应 Dialector 处理方言差异。
+
+## ants 协程池
+
+`https://github.com/panjf2000/ants.git`
+
+在 Go 中，goroutine 是一种轻量级线程，非常易于创建。但是在高并发场景下，如果无限制地创建 goroutine，可能导致：
+
+- 内存飙升
+- GC 压力增大
+- 系统调度负载变重
+- 宕机（out-of-memory）
+
+因此，我们需要**对 goroutine 数量进行限制**，即协程池（Goroutine Pool）。
+
+###  整体架构思路
+
+`ants`的核心思想是：
+
+1. **任务复用**：不重复创建 goroutine，而是复用已经创建的 worker。
+2. **worker 缓存管理**：通过队列（如栈结构）管理空闲 worker。
+3. **自动回收机制**：当 worker 超过设定的空闲时间，会被回收以释放资源。
+4. **灵活策略选择**：支持不同类型的 worker 队列（如 stack、loopQueue）。
+
+`ants`提供了一些选项可以定制 goroutine 池的行为。选项使用`Options`结构定义：
+
+```go
+type Options struct {
+  ExpiryDuration time.Duration
+  PreAlloc bool
+  MaxBlockingTasks int
+  Nonblocking bool
+  PanicHandler func(interface{})
+  Logger Logger
+}
+```
+
+各个选项含义如下：
+
+- `ExpiryDuration`：过期时间。表示 goroutine 空闲多长时间之后会被`ants`池回收
+- `PreAlloc`：预分配。调用`NewPool()/NewPoolWithFunc()`之后预分配`worker`（管理一个工作 goroutine 的结构体）切片。而且使用预分配与否会直接影响池中管理`worker`的结构。见下面源码
+- `MaxBlockingTasks`：最大阻塞任务数量。即池中 goroutine 数量已到池容量，且所有 goroutine 都处理繁忙状态，这时到来的任务会在阻塞列表等待。这个选项设置的是列表的最大长度。阻塞的任务数量达到这个值后，后续任务提交直接返回失败
+- `Nonblocking`：池是否阻塞，默认阻塞。提交任务时，如果`ants`池中 goroutine 已到上限且全部繁忙，阻塞的池会将任务添加的阻塞列表等待（当然受限于阻塞列表长度，见上一个选项）。非阻塞的池直接返回失败
+- `PanicHandler`：panic 处理。遇到 panic 会调用这里设置的处理函数
+- `Logger`：指定日志记录器
+
+### 生命周期流程
+
+1. 用户调用 `Submit(func)`：
+   - 从 pool 的 workerQueue 中 `detach()` 一个可用的 worker。
+   - 如果没有可用 worker，则新建一个（前提：没达到上限）。
+2. 把任务函数塞给 worker，worker 执行 `run()`。
+3. worker 任务执行完后：
+   - 更新 lastUsedTime；
+   - 再次 `insert()` 回队列，等待复用。
+4. 每隔一段时间（如定时器）：
+   - 执行一次 `refresh(duration)`，清理过期的 worker。
+5. 用户主动 `Release()` 协程池时：
+   - 调用 `reset()`，释放所有 worker 资源。
+
+### worker
+
+> `worker` 这个接口定义了一个 worker（本质上就是一个可以执行任务的 goroutine）所应实现的操作：
+
+```go
+type worker interface {
+	run()                        // run()：worker 执行任务。
+	finish()                     // finish()：worker 被关闭/回收时调用。
+	lastUsedTime() time.Time     // lastUsedTime() / setLastUsedTime(t)：记录/更新最后一次被使用的时间，用于判断是否过期。
+	setLastUsedTime(t time.Time) 
+	inputFunc(func())            // inputFunc() / inputArg()：为该 worker 设置待执行的函数及其参数。
+	inputArg(any)                
+}
+```
+
+> workerQueue 是一个“空闲 worker 容器”，实现方式包括：栈（LIFO）、环形队列（FIFO）等，支持根据是否设置了 PreAlloc切换。
+>
+> 如果设置了 PreAlloc，则使用循环队列（loopQueue）的方式存取这个 workers。在初始化 pool 的时候，就初始化了 capacity 长度的循环队列，取的时候从队头取，插入的时候往队列尾部插入，整体 queue 保持在 capacity 长度。
+>
+> 如果没有设置 PreAlloc，则使用堆栈（stack）的方式存取这个 workers。初始化的时候不初始化任何的 worker，在第一次取的时候在 stack 中取不到，则会从 sync.Pool 中初始化并取到对象，然后使用完成后插入到 当前这个栈中。下次取就直接从 stack 中再获取了。
+
+```go
+type workerQueue interface {
+	len() int
+	isEmpty() bool
+	insert(worker) error                     // 插入 
+	detach() worker                          // 弹出 
+	refresh(duration time.Duration) []worker // 回收过期 worker
+	reset()                                  // 清空并释放 
+}
+```
+
+#### 栈实现（动态管理）
+
+```go
+// workerStack 结构体用于管理协程池（Goroutine Pool）中的工作单元（worker）
+type workerStack struct {
+	items  []worker // 存储当前活跃且可复用的 worker（按最后一次使用时间排序，栈顶是最新使用的 worker）
+	expiry []worker // 临时存储已过期的 worker（在清理操作中暂存待回收的 worker）
+}
+```
+
+- `insert(w worker) `插入一个 worker 到栈顶。
+
+```go
+func (ws *workerStack) insert(w worker) error {
+	ws.items = append(ws.items, w)
+	return nil
+}
+```
+
+- `detach() `弹出最近使用的一个 worker（栈顶元素）。
+
+```go
+func (ws *workerStack) detach() worker {
+	l := ws.len()
+	if l == 0 {
+		return nil
+	}
+	w := ws.items[l-1]
+	ws.items[l-1] = nil // avoid memory leaks
+	ws.items = ws.items[:l-1]
+	return w
+}
+```
+
+- `refresh(duration) `回收一定时间未使用的 worker：
+
+> 对 `items` 按时间进行二分查找；
+>
+> 将过期的 `worker` 移动到 `expiry`；
+>
+> 剩余的 worker 前移，确保 items 紧凑，避免内存浪费。
+
+```go
+func (ws *workerStack) refresh(duration time.Duration) []worker {
+	n := ws.len()
+	if n == 0 {
+		return nil
+	}
+
+	expiryTime := time.Now().Add(-duration)
+	index := ws.binarySearch(0, n-1, expiryTime)
+
+	ws.expiry = ws.expiry[:0]
+	if index != -1 {
+		ws.expiry = append(ws.expiry, ws.items[:index+1]...)
+		m := copy(ws.items, ws.items[index+1:])
+		for i := m; i < n; i++ {
+			ws.items[i] = nil
+		}
+		ws.items = ws.items[:m]
+	}
+	return ws.expiry
+}
+```
+
+- `reset() `用于彻底销毁协程池（例如：关闭时），调用每个 worker 的 `finish()` 并清空内存。
+
+```go
+func (ws *workerStack) reset() {
+	for i := 0; i < ws.len(); i++ {
+		ws.items[i].finish()
+		ws.items[i] = nil
+	}
+	ws.items = ws.items[:0]
+}
+```
+
+#### 队列实现（预分配大小）
+
+```go
+type loopQueue struct {
+	items  []worker // 存放 worker 的循环数组
+	expiry []worker // 存放超时过期的 worker
+	head   int      // 队头索引
+	tail   int      // 队尾索引
+	size   int      // 队列大小
+	isFull bool     // 是否满了
+}
+```
+
+`loopQueue` 是一个**固定容量的循环队列**，用于：
+
+- 快速插入和移除 worker
+- 支持高效的过期清理（通过二分查找）
+- 保证并发调度性能
+
+### 条件变量
+
+
+
+### 自旋锁
+
+
+
+
 
 ## Web相关
 
