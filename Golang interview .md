@@ -3393,6 +3393,301 @@ case <-time.After(1 * time.Second): // 超时处理
 }
 ```
 
+### 限流
+
+限流的目的是 **保护系统稳定性**：
+
+- 避免瞬时高并发把数据库、缓存、下游服务打爆。
+- 保证系统“削峰填谷”，在可承受范围内处理请求。
+
+#### 常见限流算法
+
+**固定窗口 (Fixed Window)**
+
+它在指定周期内累加访问次数，当访问次数达到设定的阈值时，触发限流策略。当进入下一个时间周期时，访问次数清零。
+
+- 在一个固定的时间窗口里统计请求数。
+- 简单，但临界点可能突发两倍流量。
+
+**滑动窗口 (Sliding Window)**
+
+滑动窗口算法是固定窗口算法的改良版，解决了固定窗口在窗口切换时会受到两倍于阈值数量的请求。其实现原理是将时间窗口分为若干个等份的小窗口，每次仅滑动一小块的时间。
+
+- 把时间窗口切成小格子，随时间滑动统计。
+- 解决了固定窗口的边界问题，但是限流不够平滑。
+
+**漏桶 (Leaky Bucket)**
+
+漏桶算法通过一个固定容量的漏桶，以固定速率处理请求。当流入请求超过桶的容量时，直接丢弃请求。
+
+- 请求先放进桶里，桶以固定速率往外漏水。
+- 无法处理突发流量，可能会丢失数据。
+
+**令牌桶 (Token Bucket)**
+
+令牌桶算法是基于漏桶算法的一种改进，能够在限制服务调用的平均速率的同时，允许一定程度内的突发调用。
+
+- 系统按照固定速率往桶里放令牌，请求来了必须拿到令牌才能通过。
+- 可以应对突发流量（允许桶里存一些令牌）。
+
+#### Sentinel限流机制
+
+阿里巴巴的 **Sentinel** 是一个分布式流量防护组件，支持 **限流、熔断、降级**。
+ 核心是对 **资源** 做流量控制，常见限流模式有：
+
+1. **QPS 限流**
+   - 限制某个接口每秒最多能处理多少请求。
+   - 超过直接拒绝或者排队等待。
+2. **线程数限流**
+   - 限制某个接口同时运行的线程数。
+   - 防止服务被大并发阻塞。
+3. **关联限流**
+   - A 资源依赖 B，当 B 被压垮时，限制 A 的访问。
+4. **链路限流**
+   - 只针对某条调用链上的流量做限流，不影响其他链路。
+
+```go
+import (
+    "fmt"
+    "github.com/alibaba/sentinel-golang/api"
+    "github.com/alibaba/sentinel-golang/core/flow"
+)
+
+func main() {
+    // 初始化 Sentinel
+    err := api.InitDefault()
+    if err != nil {
+        fmt.Println(err)
+        return
+    }
+
+    // 定义限流规则：资源名 "myAPI"，QPS 限制为 5
+    _, err = flow.LoadRules([]*flow.Rule{
+        {
+            Resource:               "myAPI",
+            TokenCalculateStrategy: flow.Direct,
+            ControlBehavior:        flow.Reject, // 超过直接拒绝
+            Threshold:              5,           // QPS = 5
+            StatIntervalInMs:       1000,
+        },
+    })
+    if err != nil {
+        fmt.Println(err)
+        return
+    }
+
+    // 模拟请求
+    for i := 0; i < 10; i++ {
+        e, b := api.Entry("myAPI")
+        if b != nil {
+            // 被限流了
+            fmt.Println("blocked")
+        } else {
+            // 通过
+            fmt.Println("passed")
+            e.Exit()
+        }
+    }
+}
+```
+
+Sentinel = **流量防护中间件**，不仅仅是限流，还包括熔断降级。
+
+限流策略支持 **QPS、并发数、链路、关联** 等。
+
+Go 里用 `sentinel-golang` 包，配置规则 + `api.Entry` 即可。
+
+#### 限流策略对比
+
+
+| 模型                     | 工作原理                           | 突发流量             | 控制粒度              | 典型用途                  |
+| ---------------------- | ------------------------------ | ---------------- | ----------------- | --------------------- |
+| **令牌桶 (Token Bucket)** | 桶里按固定速率放令牌，请求要拿到令牌才能执行         | ✅ 支持，桶里存的令牌可一次用掉 | 控制平均速率，允许瞬时突发     | API 限流、突发请求场景         |
+| **漏桶 (Leaky Bucket)**  | 请求进桶里，按固定速率往外“漏”               | ❌ 不支持，速率恒定       | 严格控制流出速率          | 网络流量整形，支付扣款等需要稳定速率的场景 |
+| **Sentinel 流控**        | 在资源维度做统计，支持 QPS、并发数、链路、关联等限流策略 | ✅ 支持（不同策略灵活）     | 除速率外，还能限制线程数、调用链等 | 微服务流量防护、熔断、降级         |
+
+#### 分布式限流
+
+单机限流（本地限流）只是在本进程内统计 QPS 或并发数。
+
+如果你的服务部署了多台机器，每台都限流 100 QPS，总体 QPS 就可能变成 **100 × N**，超出了预期。所以需要 **分布式限流**，在集群层面统一统计。
+
+##### **Sentinel 的分布式限流方案**
+
+Sentinel 提供了一个 **集群流控模式 (Cluster Flow Control)**，分为两种角色：
+
+1. **Token Server（限流服务端）**
+   - 负责集中管理某些资源的限流状态（QPS、并发数）。
+   - 保存统计数据和限流规则。
+2. **Token Client（限流客户端）**
+   - 部署在业务进程里，每次访问资源时，不是本地判断，而是向 **Token Server 请求令牌**。
+   - 如果 Server 返回成功 → 请求通过；返回失败 → 请求被限流。
+
+> **多个 Client 部署**，都去请求同一个 **Token Server**。
+>
+> **Token Server 负责全局计数**，保证多机限流一致。
+>
+> 如果 **Token Server 不可用**，Client 会降级为 **本地限流**，避免服务不可用。
+>
+> 一般会结合 **Sentinel Dashboard**，动态下发规则，不需要写死在代码里。
+
+这样，多个应用实例就可以共享同一套限流规则，实现 **全局限流**。
+
+##### Redis 分布式限流
+
+Redis 是集中式存储：所有机器的请求都会访问 Redis 里的同一个 Key。
+
+原子操作：`INCR`、Lua 脚本都是原子性的，能保证并发下的一致性。
+
+过期控制：利用 `EXPIRE` 可以自动清理数据，减少内存压力。
+
+Redis 天然是一个高性能的分布式存储，所以可以作为全局**计数器**或**令牌桶**，保证多台服务实例之间共享限流状态。
+
+**1. 固定窗口计数器（Fixed Window Counter）**
+
+- 每次请求到来时，用 `INCR` 对某个 key（比如 `limit:api:20250915-15:30`）自增。
+- 设置过期时间 `EXPIRE`。
+- 如果自增值超过阈值，就拒绝请求。
+- 缺点：临界点可能出现突刺（比如 9:59:59 允许 100 次，10:00:00 又允许 100 次）。
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+var ctx = context.Background()
+
+func main() {
+	// 初始化 Redis 客户端
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "127.0.0.1:6379", // Redis 地址
+		Password: "",               // 无密码
+		DB:       0,                // 默认 DB
+	})
+
+	// 限流参数
+	limit := 5              // 每秒最大请求数
+	resource := "myAPI"     // 资源名
+
+	for i := 0; i < 10; i++ {
+		allowed, err := isAllowed(rdb, resource, limit)
+		if err != nil {
+			fmt.Println("Error:", err)
+			continue
+		}
+
+		if allowed {
+			fmt.Println(i, "passed", time.Now().Format("15:04:05.000"))
+		} else {
+			fmt.Println(i, "blocked", time.Now().Format("15:04:05.000"))
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// isAllowed 判断是否允许访问（固定窗口限流）
+func isAllowed(rdb *redis.Client, resource string, limit int) (bool, error) {
+	// key = resource + 当前秒
+	key := fmt.Sprintf("limit:%s:%d", resource, time.Now().Unix())
+
+	// 使用 INCR 计数，并设置过期时间 1 秒
+	val, err := rdb.Incr(ctx, key).Result()
+	if err != nil {
+		return false, err
+	}
+
+	if val == 1 {
+		// 第一次访问，设置过期时间 1 秒
+		rdb.Expire(ctx, key, time.Second)
+	}
+
+	return val <= int64(limit), nil
+}
+// INCR 原子性保证：在高并发下多台机器同时请求同一个 key，也不会出现计数错误。
+// Expire 设置为 1 秒，表示固定窗口每秒统计一次。
+// 超过 limit 的请求返回 blocked，否则返回 passed。
+// 多实例部署时，只要访问同一个 Redis 就可以实现 全局分布式限流。
+```
+
+**2. 滑动窗口（Sliding Window）**
+
+- 在 Redis 中用 `ZSET` 存储每次请求的时间戳。
+- 请求到来时：
+  - 先删除超出窗口时间的请求记录（`ZREMRANGEBYSCORE`）。
+  - 然后统计 `ZCARD` 看请求数是否超过阈值。
+- 更平滑，但开销稍大。
+
+```go
+// Lua 脚本实现滑动窗口限流
+// KEYS[1] - 资源 key
+// ARGV[1] - 当前时间戳（毫秒）
+// ARGV[2] - 窗口长度（毫秒）
+// ARGV[3] - 限流数量
+var luaScript = `
+-- 删除过期记录
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1] - ARGV[2])
+-- 当前数量
+local count = redis.call('ZCARD', KEYS[1])
+if tonumber(count) >= tonumber(ARGV[3]) then
+	return 0
+else
+	-- 添加当前请求
+	redis.call('ZADD', KEYS[1], ARGV[1], ARGV[1])
+	-- 设置过期
+	redis.call('PEXPIRE', KEYS[1], ARGV[2])
+	return 1
+end
+`
+
+// isAllowed 判断是否允许访问
+func isAllowed(rdb *redis.Client, resource string, limit int, window int64) (bool, error) {
+	now := time.Now().UnixNano() / int64(time.Millisecond) // 当前时间戳毫秒
+	key := fmt.Sprintf("limit:%s", resource)
+
+	res, err := rdb.Eval(ctx, luaScript, []string{key}, now, window, limit).Result()
+	if err != nil {
+		return false, err
+	}
+
+	return res.(int64) == 1, nil
+}
+
+/*
+ZSET 存储时间戳,集合按时间排序，便于删除过期请求。
+Lua 脚本会先删除超过窗口时间的请求 (ZREMRANGEBYSCORE)。再统计当前请求数 (ZCARD) 是否超过阈值。
+Lua 脚本保证 删除 + 统计 + 添加 三步在 Redis 内部一次完成，避免并发问题。
+PEXPIRE 设置 key 的过期时间，防止集合无限增长。
+*/
+```
+
+**3. 令牌桶（Token Bucket）**
+
+- 在 Redis 存一个“桶”，里面放令牌数。
+- 定时往桶里加令牌（可用 Lua 脚本或定时任务）。
+- 每个请求尝试 `DECR` 一个令牌，如果失败则拒绝。
+- 能应对突发流量（只要桶里有余量就能冲一下）。
+
+> 实现原理：
+>
+> 1.在 Redis 存一个“桶”，里面放令牌数。
+>
+> 2.定时往桶里加令牌（可用 Lua 脚本或定时任务）。
+>
+> 3.每个请求尝试 `DECR` 一个令牌，如果失败则拒绝。
+>
+> 能应对突发流量（只要桶里有余量就能冲一下）。
+
+
+
+
+
 ## 第三方库
 
 ### Gin
